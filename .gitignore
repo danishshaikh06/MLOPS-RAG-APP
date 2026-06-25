@@ -172,3 +172,5 @@ dvc-service-account-key.json
 
 # MacOS
 .DS_Store
+
+logs

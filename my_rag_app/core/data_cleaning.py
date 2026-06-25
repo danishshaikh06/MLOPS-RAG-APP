@@ -1,29 +1,33 @@
+"""
+Data cleaning — loads emails with body_clean IS NULL, strips noise from the
+body, flags system emails, and writes results back to the same rows.
+"""
+
 import re
 import json
 from pathlib import Path
-from my_rag_app.logger import logger
+from datetime import datetime, timezone
+from dataclasses import asdict
 
-# ---------------------------------------------------------------------------
-# Patterns — compiled once at module level
-# ---------------------------------------------------------------------------
+from my_rag_app.entity.reports import CleaningReport
+from my_rag_app.logger import get_logger
+from my_rag_app.entity.models import Email
+from my_rag_app.config.config import get_session
+from my_rag_app.constants import CLEANING_REPORT_PATH 
 
+logger = get_logger(__name__)
+
+REPORT_FILE = CLEANING_REPORT_PATH
+
+
+# Patterns
 GREETING_RE = re.compile(r"^Dear\s+.{1,60}?\s*,?\s*$", re.MULTILINE)
-
 SIGNATURE_ANCHOR_RE = re.compile(
     r"(Thanks\s*&\s*Regards|Best\s+[Rr]egards|Regards\s*,?|Sincerely\s*,?).*",
     re.DOTALL | re.IGNORECASE,
 )
-
-CONFIDENTIALITY_RE = re.compile(
-    r"This\s+E[\-\s]?Mail\s+and\s+any\s+files\s+transmitted.*",
-    re.DOTALL | re.IGNORECASE,
-)
-
-PRINT_REMINDER_RE = re.compile(
-    r"We\s+have\s+a\s+responsibility\s+to\s+the\s+environment.*",
-    re.DOTALL | re.IGNORECASE,
-)
-
+CONFIDENTIALITY_RE = re.compile(r"This\s+E[\-\s]?Mail\s+and\s+any\s+files\s+transmitted.*", re.DOTALL | re.IGNORECASE)
+PRINT_REMINDER_RE  = re.compile(r"We\s+have\s+a\s+responsibility\s+to\s+the\s+environment.*", re.DOTALL | re.IGNORECASE)
 CID_RE             = re.compile(r"\[cid:[^\]]+\]", re.IGNORECASE)
 OUTLOOK_FOOTER_RE  = re.compile(r"Get\s+Outlook\s+for\s+\w+.*", re.DOTALL | re.IGNORECASE)
 SENT_FROM_RE       = re.compile(r"Sent\s+from\s+my\s+\w[\w\s]{0,20}", re.IGNORECASE)
@@ -34,128 +38,54 @@ FEEDBACK_RE        = re.compile(
     r"(To\s+serve\s+you\s+better|please\s+complete\s+this\s+survey|click\s+here\s+for\s+valuable\s+feedback|provide\s+your\s+valuable\s+feedback).*",
     re.DOTALL | re.IGNORECASE,
 )
-URL_RE             = re.compile(r"https?://\S+")
+URL_RE = re.compile(r"https?://\S+")
 
-SYSTEM_SENDER_DOMAINS  = {"ionos.com", "mailer-daemon"}
+SYSTEM_SENDER_DOMAINS   = {"ionos.com", "mailer-daemon"}
 SYSTEM_SUBJECT_PREFIXES = ("welcome to mail", "daily report mailbox", "spam report")
 
 
-# ---------------------------------------------------------------------------
-# Pipeline class
-# ---------------------------------------------------------------------------
+class CleaningPipeline:
 
-class EmailCleaningPipeline:
+    def run(self) -> dict:
+        with get_session() as session:
+            rows = session.query(Email).filter(Email.body_clean.is_(None)).all()
+            logger.info("Cleaning | %d email(s) pending", len(rows))
 
-    def __init__(self, input_path: Path, output_path: Path):
-        self.input_path  = input_path
-        self.output_path = output_path
+            system_count = empty_count = 0
+            for row in rows:
+                row.is_system_email = self._is_system_email(row.sender_email, row.subject)
+                row.body_clean = "" if row.is_system_email else self._clean_body(row.body_raw)
+                row.cleaned_at = datetime.now(timezone.utc)
 
-    # ------------------------------------------------------------------
-    # Entry point
-    # ------------------------------------------------------------------
+                if row.is_system_email:
+                    system_count += 1
+                elif not row.body_clean.strip():
+                    empty_count += 1
 
-    def run(self) -> None:
-        logger.info("Starting cleaning pipeline | input=%s", self.input_path)
+            session.commit()
 
-        emails = self._load(self.input_path)
-        before = len(emails)
+        data_cleaning_report = CleaningReport(cleaned= len(rows), system_emails= system_count, empty_after_clean= empty_count)
+        report = asdict(data_cleaning_report)
+        logger.info("Cleaning complete | %s", report)
+        self._write_report(report)
+        return report
 
-        emails = self._deduplicate(emails)
-        after  = len(emails)
-        if before != after:
-            logger.info("Deduplication removed %d records", before - after)
-
-        total = system = empty = 0
-        with open(self.output_path, "w", encoding="utf-8") as outfile:
-            for email in emails:
-                cleaned = self._process(email)
-                outfile.write(json.dumps(cleaned) + "\n")
-                total += 1
-                if cleaned["is_system_email"]:
-                    system += 1
-                    logger.debug("System email | id=%s", email.get("id"))
-                elif not cleaned["body_clean"]:
-                    empty += 1
-                    logger.debug("Empty after clean | id=%s", email.get("id"))
-
-        logger.info(
-            "Cleaning complete | total=%d system=%d empty=%d output=%s",
-            total, system, empty, self.output_path,
-        )
-
-    # ------------------------------------------------------------------
-    # Internal steps
-    # ------------------------------------------------------------------
-
-    def _load(self, path: Path) -> list[dict]:
-        emails = []
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    line = line.strip()
-                    if line:
-                        emails.append(json.loads(line))
-                except json.JSONDecodeError:
-                    logger.warning("Skipping malformed JSON line")
-                    continue
-        return emails
-
-    def _deduplicate(self, emails: list[dict]) -> list[dict]:
-        seen   = set()
-        unique = []
-        for email in emails:
-            eid = email.get("id")
-            if eid not in seen:
-                seen.add(eid)
-                unique.append(email)
-        return unique
-
-    def _process(self, email: dict) -> dict:
-        result = dict(email)
-        result = self._normalize_addresses(result)
-        if self._is_system_email(email):
-            result["body_clean"]     = ""
-            result["is_system_email"] = True
-        else:
-            result["body_clean"]     = self._clean_body(email.get("body") or "")
-            result["is_system_email"] = False
-        return result
-
-    def _normalize_addresses(self, email: dict) -> dict:
-        """Lowercase and strip all email addresses."""
-        email["from"] = [addr.lower().strip() for addr in (email.get("from") or [])]
-        email["to"]   = [addr.lower().strip() for addr in (email.get("to")   or [])]
-        return email
-
-    def _is_system_email(self, email: dict) -> bool:
-        sender  = (email.get("from") or [""])[0].lower()
-        subject = (email.get("subject") or "").lower()
-        domain  = sender.split("@")[-1] if "@" in sender else ""
-        if domain in SYSTEM_SENDER_DOMAINS:
-            return True
-        if any(subject.startswith(p) for p in SYSTEM_SUBJECT_PREFIXES):
-            return True
-        return False
+    def _is_system_email(self, sender_email: str, subject: str) -> bool:
+        domain = sender_email.split("@")[-1].lower() if "@" in sender_email else ""
+        subject_lower = (subject or "").lower()
+        return domain in SYSTEM_SENDER_DOMAINS or any(subject_lower.startswith(p) for p in SYSTEM_SUBJECT_PREFIXES)
 
     def _clean_body(self, body: str) -> str:
-        body = ENCODING_RE.sub(" ", body)
-        body = CID_RE.sub("", body)
-        body = CONFIDENTIALITY_RE.sub("", body)
-        body = PRINT_REMINDER_RE.sub("", body)
-        body = FEEDBACK_RE.sub("", body)
-        body = MARKETING_RE.sub("", body)
-        body = SOCIAL_MEDIA_RE.sub("", body)
-        body = OUTLOOK_FOOTER_RE.sub("", body)
-        body = SENT_FROM_RE.sub("", body)
-        body = URL_RE.sub("", body)
+        body = ENCODING_RE.sub(" ", body or "")
+        for pattern in (CID_RE, CONFIDENTIALITY_RE, PRINT_REMINDER_RE, FEEDBACK_RE,
+                        MARKETING_RE, SOCIAL_MEDIA_RE, OUTLOOK_FOOTER_RE, SENT_FROM_RE, URL_RE):
+            body = pattern.sub("", body)
         body = GREETING_RE.sub("", body)
         body = SIGNATURE_ANCHOR_RE.sub("", body)
-        body = self._normalize_whitespace(body)
-        return body
+        return self._normalize_whitespace(body)
 
     def _normalize_whitespace(self, text: str) -> str:
-        text  = text.replace("\r\n", "\n").replace("\r", "\n")
-        lines = [line.strip() for line in text.split("\n")]
+        lines = [l.strip() for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
         cleaned, prev_blank = [], False
         for line in lines:
             is_blank = line == ""
@@ -165,14 +95,11 @@ class EmailCleaningPipeline:
             prev_blank = is_blank
         return "\n".join(cleaned).strip()
 
+    def _write_report(self, report: dict) -> None:
+        REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2)
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    pipeline = EmailCleaningPipeline(
-        input_path=Path("C:\\Users\\Omen\\Downloads\\RAG PIPELINE\\data\\raw\\emails_v4.jsonl"),
-        output_path=Path("C:\\Users\\Omen\\Downloads\\RAG PIPELINE\\data\\cleaned\\cleaned_emails_v4.jsonl"),
-    )
-    pipeline.run()
+    CleaningPipeline().run()

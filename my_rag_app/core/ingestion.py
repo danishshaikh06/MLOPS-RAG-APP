@@ -1,29 +1,37 @@
+"""
+Data ingestion — scrapes emails via IMAP, resolves threads (3-tier strategy),
+and writes new records directly into the `emails` Postgres table.
+Existing email IDs are skipped entirely (immutable once ingested).
+"""
+
 import os
 import re
 import json
 import time
 from pathlib import Path
+from datetime import datetime, timezone
 from email import message_from_bytes
 from email.header import decode_header
 from email.utils import parsedate_to_datetime, getaddresses
-from my_rag_app.logger import logger
-from my_rag_app.exception import MyException
-
+from dataclasses import asdict
 import imaplib
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 
+from my_rag_app.logger import get_logger
+from my_rag_app.entity.models import Email
+from my_rag_app.config.config import get_session
+from my_rag_app.constants import MAX_RETRIES, RETRY_DELAY_SECONDS, INGESTION_PROGRESS_FILE, INGESTION_REPORT_PATH
+from my_rag_app.entity.reports import IngestionReport
 
-# ---------------------------------------------------------------------------
+logger = get_logger(__name__)
+
+
 # Config
-# ---------------------------------------------------------------------------
+IMAP_PORT     = 993
+PROGRESS_FILE = INGESTION_PROGRESS_FILE
+REPORT_FILE   = INGESTION_REPORT_PATH 
 
-IMAP_PORT          = 993
-MAX_CONNECT_RETRIES = 3
-RETRY_DELAY_SECONDS  = 5
-PROGRESS_FILE        = Path("data/raw/.scrape_progress")
-
-# Reply-chain quoting markers — lines from here onward are removed from body
 REPLY_CHAIN_MARKERS = [
     r"^-{2,}\s*Original Message\s*-{2,}",
     r"^On .{5,100} wrote:$",
@@ -32,10 +40,7 @@ REPLY_CHAIN_MARKERS = [
 SUBJECT_PREFIX_RE = re.compile(r"^\s*(re|fw|fwd)\s*:\s*", re.IGNORECASE)
 
 
-# ---------------------------------------------------------------------------
 # IMAP fetching
-# ---------------------------------------------------------------------------
-
 class ImapFetcher:
     """Handles IMAP connection and raw message retrieval, with retry logic."""
 
@@ -48,7 +53,7 @@ class ImapFetcher:
 
     def connect(self) -> None:
         last_error = None
-        for attempt in range(1, MAX_CONNECT_RETRIES + 1):
+        for attempt in range(1, MAX_RETRIES + 1):
             try:
                 self.conn = imaplib.IMAP4_SSL(self.host, self.port)
                 self.conn.login(self.email_addr, self.password)
@@ -57,21 +62,20 @@ class ImapFetcher:
             except Exception as e:
                 last_error = e
                 logger.warning(
-                    "IMAP connection attempt %d/%d failed | error=%s",
-                    attempt, MAX_CONNECT_RETRIES, e,
+                    "IMAP connection attempt %d/%d failed | error=%s", attempt, MAX_RETRIES, e,
                 )
-                if attempt < MAX_CONNECT_RETRIES:
+                if attempt < MAX_RETRIES:
                     time.sleep(RETRY_DELAY_SECONDS)
 
-        logger.error("IMAP connection failed after %d attempts", MAX_CONNECT_RETRIES)
-        raise MyException(f"Could not connect to IMAP host {self.host}") from last_error
+        logger.error("IMAP connection failed after %d attempts", MAX_RETRIES)
+        raise ConnectionError(f"Could not connect to IMAP host {self.host}") from last_error
 
     def fetch_all_message_ids(self, mailbox: str = "INBOX") -> list[bytes]:
         self.conn.select(mailbox, readonly=True)
         status, data = self.conn.search(None, "ALL")
         if status != "OK":
             logger.error("IMAP search failed | status=%s", status)
-            raise MyException(f"IMAP SEARCH failed with status {status}")
+            raise RuntimeError(f"IMAP SEARCH failed with status {status}")
         ids = data[0].split()
         logger.info("Found %d messages in mailbox '%s'", len(ids), mailbox)
         return ids
@@ -93,13 +97,11 @@ class ImapFetcher:
                 self.conn.close()
                 self.conn.logout()
         except Exception:
-            pass  # best-effort cleanup, nothing to act on if it fails
+            pass
 
 
-# ---------------------------------------------------------------------------
+
 # Message parsing
-# ---------------------------------------------------------------------------
-
 class MessageParser:
     """Parses a raw RFC822 message into our intermediate dict format."""
 
@@ -115,11 +117,13 @@ class MessageParser:
             logger.warning("Message has no Message-ID — skipping")
             return None
 
-        subject    = self._decode_header_value(msg.get("Subject", ""))
-        from_addrs = self._extract_addresses(msg.get("From", ""))
-        to_addrs   = self._extract_addresses(msg.get("To", ""))
-        date_iso   = self._parse_date(msg.get("Date", ""))
-        references = self._parse_references(msg.get("References", ""))
+        subject     = self._decode_header_value(msg.get("Subject", ""))
+        from_addrs  = self._extract_addresses(msg.get("From", ""))
+        to_pairs    = self._extract_name_email_pairs(msg.get("To", ""))
+        to_addrs    = [addr for _, addr in to_pairs]
+        to_names    = [name for name, _ in to_pairs if name]
+        date_dt     = self._parse_date(msg.get("Date", ""))
+        references  = self._parse_references(msg.get("References", ""))
         in_reply_to = self._clean_id(msg.get("In-Reply-To", ""))
 
         body = self._extract_body(msg)
@@ -131,14 +135,11 @@ class MessageParser:
             "body":         body,
             "from":         from_addrs,
             "to":           to_addrs,
-            "date":         date_iso,
-            "_references":  references,    # internal use only — consumed by ThreadResolver
-            "_in_reply_to": in_reply_to,    # internal use only
+            "to_names":     to_names,
+            "date":         date_dt,
+            "_references":  references,
+            "_in_reply_to": in_reply_to,
         }
-
-    # ------------------------------------------------------------------
-    # Header decoding
-    # ------------------------------------------------------------------
 
     def _decode_header_value(self, raw_value: str) -> str:
         if not raw_value:
@@ -159,10 +160,20 @@ class MessageParser:
     def _clean_id(self, raw_id: str) -> str:
         return raw_id.strip() if raw_id else ""
 
+    def _extract_name_email_pairs(self, raw_value: str) -> list[tuple[str, str]]:
+        """Returns [(display_name, email), ...]. display_name is '' if absent."""
+        if not raw_value:
+            return []
+        try:
+            pairs = getaddresses([raw_value])
+            return [(name.strip(), addr.lower().strip()) for name, addr in pairs if addr]
+        except Exception as e:
+            logger.debug("Address parse failed | raw=%r error=%s", raw_value, e)
+            return []
+
     def _parse_references(self, raw_refs: str) -> list[str]:
         if not raw_refs:
             return []
-        # References header is whitespace-separated list of <id> tokens
         return re.findall(r"<[^<>]+>", raw_refs)
 
     def _extract_addresses(self, raw_value: str) -> list[str]:
@@ -175,19 +186,14 @@ class MessageParser:
             logger.debug("Address parse failed | raw=%r error=%s", raw_value, e)
             return []
 
-    def _parse_date(self, raw_date: str) -> str:
+    def _parse_date(self, raw_date: str) -> datetime | None:
         if not raw_date:
-            return ""
+            return None
         try:
-            dt = parsedate_to_datetime(raw_date)
-            return dt.isoformat()
+            return parsedate_to_datetime(raw_date)
         except Exception as e:
             logger.debug("Date parse failed | raw=%r error=%s", raw_date, e)
-            return ""
-
-    # ------------------------------------------------------------------
-    # Body extraction
-    # ------------------------------------------------------------------
+            return None
 
     def _extract_body(self, msg) -> str:
         plain_text = None
@@ -248,10 +254,8 @@ class MessageParser:
         return body.strip()
 
 
-# ---------------------------------------------------------------------------
-# Thread resolution (3-tier, second pass over all parsed emails)
-# ---------------------------------------------------------------------------
 
+# Thread resolution (3-tier, second pass over all parsed emails)
 class ThreadResolver:
     """
     Assigns thread_id and reply_to using a 3-tier strategy:
@@ -264,7 +268,6 @@ class ThreadResolver:
     def resolve(self, emails: list[dict]) -> list[dict]:
         by_id = {e["id"]: e for e in emails}
 
-        # --- Tier 1: References ---
         for e in emails:
             refs = e.get("_references", [])
             if refs:
@@ -272,25 +275,20 @@ class ThreadResolver:
                 e["reply_to"]  = e.get("_in_reply_to", "") or refs[-1]
                 e["thread_match_method"] = "references"
 
-        # --- Tier 2: In-Reply-To (only for those still unresolved) ---
         for e in emails:
             if e.get("thread_id"):
                 continue
             parent_id = e.get("_in_reply_to", "")
             if parent_id and parent_id in by_id:
                 parent = by_id[parent_id]
-                # Inherit parent's thread_id if parent already resolved (Tier 1),
-                # otherwise fall back to the parent's own id as the root.
                 e["thread_id"] = parent.get("thread_id") or parent_id
                 e["reply_to"]  = parent_id
                 e["thread_match_method"] = "in_reply_to"
 
-        # --- Tier 3: subject + participant overlap fallback ---
         unresolved = [e for e in emails if not e.get("thread_id")]
         if unresolved:
             self._resolve_by_subject(unresolved, by_id)
 
-        # --- Anything still unresolved: true original, self-referencing ---
         for e in emails:
             if not e.get("thread_id"):
                 e["thread_id"] = e["id"]
@@ -308,7 +306,6 @@ class ThreadResolver:
         return s.lower()
 
     def _resolve_by_subject(self, unresolved: list[dict], by_id: dict) -> None:
-        # Group unresolved emails by normalized subject
         groups: dict[str, list[dict]] = {}
         for e in unresolved:
             norm_subj = self._normalize_subject(e.get("subject", ""))
@@ -318,16 +315,13 @@ class ThreadResolver:
 
         for norm_subj, group in groups.items():
             if len(group) < 2:
-                continue  # nothing to link — single email, stays unresolved -> becomes "original"
+                continue
 
-            # Check participant overlap pairwise; only merge emails that share
-            # at least one sender/recipient address with another in the group
             linked = self._filter_by_participant_overlap(group)
             if len(linked) < 2:
                 continue
 
-            # Earliest email (by date) becomes the thread root
-            linked.sort(key=lambda e: e.get("date") or "")
+            linked.sort(key=lambda e: e.get("date") or datetime.min.replace(tzinfo=timezone.utc))
             root = linked[0]
             root_thread_id = root["id"]
 
@@ -340,8 +334,6 @@ class ThreadResolver:
                 e["thread_match_method"] = "subject_fallback"
 
     def _filter_by_participant_overlap(self, group: list[dict]) -> list[dict]:
-        """Keep only emails that share at least one participant address with
-        at least one other email in the group."""
         participant_sets = []
         for e in group:
             participants = set(e.get("from", [])) | set(e.get("to", []))
@@ -358,10 +350,8 @@ class ThreadResolver:
         return keep
 
 
-# ---------------------------------------------------------------------------
-# Progress tracking (resumable runs)
-# ---------------------------------------------------------------------------
 
+# Progress tracking (resumable runs)
 class ProgressTracker:
     def __init__(self, progress_file: Path):
         self.progress_file = progress_file
@@ -383,21 +373,16 @@ class ProgressTracker:
         except Exception as e:
             logger.warning("Could not update progress file | error=%s", e)
 
-
-# ---------------------------------------------------------------------------
 # Full pipeline
-# ---------------------------------------------------------------------------
+class IngestionPipeline:
 
-class EmailScraperPipeline:
+    def __init__(self, mailbox: str = "INBOX"):
+        self.mailbox  = mailbox
+        self.parser   = MessageParser()
+        self.resolver = ThreadResolver()
+        self.progress = ProgressTracker(PROGRESS_FILE)
 
-    def __init__(self, output_path: Path, mailbox: str = "INBOX"):
-        self.output_path = output_path
-        self.mailbox      = mailbox
-        self.parser       = MessageParser()
-        self.resolver     = ThreadResolver()
-        self.progress     = ProgressTracker(PROGRESS_FILE)
-
-    def run(self) -> None:
+    def run(self) -> dict:
         load_dotenv()
         host     = os.getenv("IMAP_HOST", "")
         addr     = os.getenv("EMAIL_ADDR", "")
@@ -418,7 +403,7 @@ class EmailScraperPipeline:
             msg_ids = fetcher.fetch_all_message_ids(self.mailbox)
 
             seen_ids = self.progress.load_seen_ids()
-            logger.info("Resuming run — %d messages already processed previously", len(seen_ids))
+            logger.info("Resuming run - %d messages already processed previously", len(seen_ids))
 
             for idx, msg_id in enumerate(msg_ids, start=1):
                 raw = fetcher.fetch_raw_message(msg_id)
@@ -432,7 +417,7 @@ class EmailScraperPipeline:
                     continue
 
                 if parsed["id"] in seen_ids:
-                    continue  # already processed in a prior run
+                    continue
 
                 parsed_emails.append(parsed)
                 self.progress.mark_seen(parsed["id"])
@@ -448,7 +433,7 @@ class EmailScraperPipeline:
             len(parsed_emails), fetch_failures, parse_failures,
         )
 
-        # Deduplicate by id (in case IMAP returns the same message twice)
+        # Deduplicate by id within this run (in case IMAP returns the same message twice)
         deduped = {}
         for e in parsed_emails:
             deduped[e["id"]] = e
@@ -456,37 +441,68 @@ class EmailScraperPipeline:
 
         resolved_emails = self.resolver.resolve(parsed_emails)
 
-        self._write_output(resolved_emails)
+        report = self._write_to_db(resolved_emails)
+        self._write_report(report)
+        return report
 
-    def _write_output(self, emails: list[dict]) -> None:
-        self.output_path.parent.mkdir(parents=True, exist_ok=True)
-
+    def _write_to_db(self, emails: list[dict]) -> dict:
         method_counts = {"references": 0, "in_reply_to": 0, "subject_fallback": 0, "original": 0}
+        inserted = 0
+        skipped_existing = 0
 
-        with open(self.output_path, "w", encoding="utf-8") as f:
+        with get_session() as session:
+            existing_ids = {row[0] for row in session.query(Email.id).all()}
+
+            new_rows = []
             for e in emails:
+                if e["id"] in existing_ids:
+                    skipped_existing += 1
+                    continue
+
                 method_counts[e.get("thread_match_method", "original")] += 1
-                record = {
-                    "id":                  e["id"],
-                    "subject":             e["subject"],
-                    "body":                e["body"],
-                    "from":                e["from"],
-                    "to":                  e["to"],
-                    "date":                e["date"],
-                    "thread_id":           e["thread_id"],
-                    "reply_to":            e["reply_to"],
-                    "thread_match_method": e["thread_match_method"],
-                }
-                f.write(json.dumps(record) + "\n")
+                new_rows.append(
+                    Email(
+                        id=e["id"],
+                        subject=e["subject"],
+                        body_raw=e["body"],
+                        body_clean=None,
+                        sender_email=(e["from"][0] if e["from"] else ""),
+                        recipient_emails=e["to"],
+                        recipient_names=e["to_names"],
+                        date=e["date"],
+                        thread_id=e["thread_id"],
+                        reply_to=e["reply_to"] or None,
+                        thread_match_method=e["thread_match_method"],
+                        is_system_email=False,  # system-email detection happens during cleaning stage
+                        cleaned_at=None,
+                    )
+                )
+
+            if new_rows:
+                session.add_all(new_rows)
+                session.commit()
+                inserted = len(new_rows)
 
         logger.info(
-            "Scraping complete | total=%d references=%d in_reply_to=%d "
-            "subject_fallback=%d original=%d output=%s",
-            len(emails),
+            "DB write complete | inserted=%d skipped_existing=%d references=%d in_reply_to=%d "
+            "subject_fallback=%d original=%d",
+            inserted, skipped_existing,
             method_counts["references"], method_counts["in_reply_to"],
             method_counts["subject_fallback"], method_counts["original"],
-            self.output_path,
         )
+        
+        data_ingestion_report = IngestionReport(inserted=inserted, skipped_existing= skipped_existing,total_processed=len(emails), thread_match_method_counts=method_counts)
+
+        return asdict(data_ingestion_report)
+    
+    def _write_report(self, report: dict) -> None:
+        REPORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(REPORT_FILE, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2)
+            logger.info("Ingestion report written | path=%s", REPORT_FILE)
+        except Exception as e:
+            logger.warning("Could not write ingestion report | error=%s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -494,7 +510,5 @@ class EmailScraperPipeline:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    pipeline = EmailScraperPipeline(
-        output_path=Path("C:\\Users\\Omen\\Downloads\\RAG PIPELINE\\data\\raw\\emails_v4.jsonl"),
-    )
+    pipeline = IngestionPipeline()
     pipeline.run()

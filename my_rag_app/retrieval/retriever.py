@@ -3,20 +3,18 @@ from my_rag_app.logger import logger
 from qdrant_client import QdrantClient, models
 from fastembed import TextEmbedding, SparseTextEmbedding
 from my_rag_app.exception import MyException
+from my_rag_app.constants import DENSE_EMBEDDING_MODEL, SPARSE_EMBEDDING_MODEL,DEFAULT_TOP_K_RETRIEVE
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-DENSE_MODEL_NAME  = "BAAI/bge-small-en-v1.5"
-SPARSE_MODEL_NAME = "Qdrant/bm25"
-DEFAULT_TOP_K     = 10
+DENSE_MODEL_NAME  = DENSE_EMBEDDING_MODEL
+SPARSE_MODEL_NAME = SPARSE_EMBEDDING_MODEL
+DEFAULT_TOP_K     = DEFAULT_TOP_K_RETRIEVE
 
 
-# ---------------------------------------------------------------------------
 # HybridRetriever
-# ---------------------------------------------------------------------------
-
 class HybridRetriever:
     """
     Retrieval layer over a Qdrant collection supporting:
@@ -61,10 +59,7 @@ class HybridRetriever:
         logger.info("Loading sparse model: %s", SPARSE_MODEL_NAME)
         self.sparse_model = SparseTextEmbedding(model_name=SPARSE_MODEL_NAME)
 
-    # ------------------------------------------------------------------
     # Filter building
-    # ------------------------------------------------------------------
-
     def _build_filter(self, filters: dict | None) -> models.Filter | None:
         """
         Converts {"field_name": value_or_list} into a Qdrant Filter.
@@ -88,10 +83,7 @@ class HybridRetriever:
 
         return models.Filter(must=conditions)
 
-    # ------------------------------------------------------------------
     # Metadata-only search — no embedding, pure payload filter
-    # ------------------------------------------------------------------
-
     def metadata_search(self, filters: dict, limit: int = 50) -> list[dict]:
         if not filters:
             logger.warning("metadata_search called with no filters — refusing to return entire collection")
@@ -115,10 +107,7 @@ class HybridRetriever:
         logger.info("metadata_search filters=%s returned %d results", filters, len(results))
         return results
 
-    # ------------------------------------------------------------------
     # Dense-only search
-    # ------------------------------------------------------------------
-
     def dense_search(self, query: str, filters: dict | None = None, top_k: int = 10) -> list[dict]:
         if not query or not query.strip():
             logger.warning("dense_search called with empty query")
@@ -150,10 +139,7 @@ class HybridRetriever:
         logger.info("dense_search query=%r returned %d results", query, len(results))
         return results
 
-    # ------------------------------------------------------------------
     # Sparse-only (BM25) search
-    # ------------------------------------------------------------------
-
     def sparse_search(self, query: str, filters: dict | None = None, top_k: int = 10) -> list[dict]:
         if not query or not query.strip():
             logger.warning("sparse_search called with empty query")
@@ -188,10 +174,7 @@ class HybridRetriever:
         logger.info("sparse_search query=%r returned %d results", query, len(results))
         return results
 
-    # ------------------------------------------------------------------
     # Hybrid search — dense + sparse, RRF-fused server-side
-    # ------------------------------------------------------------------
-
     def search(self, query: str, filters: dict | None = None, top_k: int = DEFAULT_TOP_K) -> list[dict]:
         if not query or not query.strip():
             logger.warning("search called with empty query")
@@ -242,10 +225,7 @@ class HybridRetriever:
         logger.info("search query=%r filters=%s returned %d results", query, filters, len(results))
         return results
 
-    # ------------------------------------------------------------------
     # Thread expansion
-    # ------------------------------------------------------------------
-
     def expand_threads(self, results: list[dict]) -> dict[str, list[dict]]:
         """
         For every unique thread_id among the given results, fetch ALL points

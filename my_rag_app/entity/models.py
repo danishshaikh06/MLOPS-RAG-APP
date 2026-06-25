@@ -6,6 +6,7 @@ SQLAlchemy ORM models for the RAG pipeline's 3-table schema:
 """
 
 from datetime import datetime
+
 from sqlalchemy import ForeignKey, ARRAY, Text, Boolean, DateTime
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -15,7 +16,11 @@ from my_rag_app.constants import EMAILS_TABLE, METADATA_TABLE, CHUNKS_TABLE
 class Base(DeclarativeBase):
     pass
 
-#EMAIL
+
+# ---------------------------------------------------------------------------
+# emails — raw + cleaned, combined
+# ---------------------------------------------------------------------------
+
 class Email(Base):
     __tablename__ = EMAILS_TABLE
 
@@ -27,6 +32,7 @@ class Email(Base):
 
     sender_email: Mapped[str] = mapped_column(Text, nullable=False, default="")
     recipient_emails: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
+    recipient_names: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False, default=list)
 
     date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -49,8 +55,10 @@ class Email(Base):
         return f"<Email id={self.id!r} subject={self.subject[:40]!r}>"
 
 
-
+# ---------------------------------------------------------------------------
 # metadata — derived/extracted fields, 1:1 with emails
+# ---------------------------------------------------------------------------
+
 class Metadata(Base):
     __tablename__ = METADATA_TABLE
 
@@ -71,7 +79,11 @@ class Metadata(Base):
     def __repr__(self) -> str:
         return f"<Metadata email_id={self.email_id!r} sender_name={self.sender_name!r}>"
 
+
+# ---------------------------------------------------------------------------
 # chunks — embedding-ready text unit, 1:1 with emails ("1 email = 1 chunk")
+# ---------------------------------------------------------------------------
+
 class Chunk(Base):
     __tablename__ = CHUNKS_TABLE
 
@@ -81,6 +93,8 @@ class Chunk(Base):
     thread_id: Mapped[str] = mapped_column(Text, nullable=False, index=True)
 
     text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    embedded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     created_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

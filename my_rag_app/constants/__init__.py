@@ -20,7 +20,7 @@ Purpose:
 Centralized constants for the RAG pipeline.
 Single flat module — import everything from `my_rag_app.constants`.
 """
-
+from pathlib import Path
 # ---------------------------------------------------------------------------
 # Database table names
 # ---------------------------------------------------------------------------
@@ -57,6 +57,7 @@ CHUNKING_STRATEGY = "email_chunk"
 
 DENSE_EMBEDDING_MODEL  = "BAAI/bge-small-en-v1.5"
 SPARSE_EMBEDDING_MODEL = "Qdrant/bm25"
+DENSE_DIM              = 384
 RERANKER_MODEL         = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 LLM_MODEL              = "qwen3.5:2b"
 LLM_BASE_URL           = "http://localhost:11434"
@@ -83,6 +84,17 @@ CONTEXT_MAX_TOKENS     = 5000
 
 EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
 URL_REGEX   = r"https?://\S+"
+
+# Artifact report paths — one central place, so renaming a path means editing one line
+ARTIFACTS_DIR           = Path("artifacts")
+INGESTION_REPORT_PATH   = ARTIFACTS_DIR / "raw" / "ingestion_report.json"
+CLEANING_REPORT_PATH    = ARTIFACTS_DIR / "cleaned" / "cleaning_report.json"
+CHUNKING_REPORT_PATH    = ARTIFACTS_DIR / "chunks" / "chunking_report.json"
+METADATA_REPORT_PATH    = ARTIFACTS_DIR / "metadata" / "metadata_report.json"
+INGESTION_PROGRESS_FILE = ARTIFACTS_DIR / "raw"/".scrape_progress"
+CLEANING_PROGRESS_FILE = ARTIFACTS_DIR / "cleaned"/".scrape_progress"
+METADATA_PROGRESS_FILE = ARTIFACTS_DIR / "metadata"/".scrape_progress"
+
 
 
 # ---------------------------------------------------------------------------
