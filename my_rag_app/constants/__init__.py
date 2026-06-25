@@ -1,0 +1,104 @@
+"""
+
+This package defines global constants used throughout the project. Constants
+help in maintaining consistency and avoiding magic numbers or strings in the codebase.
+
+Usage:
+    Import the required constants as needed:
+
+    Example:
+        ```python
+        from constants import APP_NAME, ENVIRONMENT
+        from constants import STATUS_OK, STATUS_BAD_REQUEST
+        ```
+
+Purpose:
+    - Centralizes constant values for maintainability and reusability.
+    - Reduces hard-coded values in the project.
+"""
+"""
+Centralized constants for the RAG pipeline.
+Single flat module — import everything from `my_rag_app.constants`.
+"""
+
+# ---------------------------------------------------------------------------
+# Database table names
+# ---------------------------------------------------------------------------
+
+EMAILS_TABLE   = "emails"
+METADATA_TABLE = "metadata"
+CHUNKS_TABLE   = "chunks"
+
+# ---------------------------------------------------------------------------
+# Qdrant configuration
+# ---------------------------------------------------------------------------
+
+QDRANT_URL        = "http://localhost:6333"
+QDRANT_COLLECTION = "email_knowledge_v1"
+DENSE_VECTOR_NAME  = "dense"
+SPARSE_VECTOR_NAME = "sparse"
+VECTOR_SIZE        = 384          # BAAI/bge-small-en-v1.5 dimension
+DISTANCE_METRIC    = "cosine"
+
+
+# ---------------------------------------------------------------------------
+# Chunking strategy
+# ---------------------------------------------------------------------------
+
+# 1 email = 1 chunk. No size/overlap settings — splitting would break the
+# semantic unit of an email (approvals, conditions, decisions live in the
+# whole message, not an arbitrary window of it).
+CHUNKING_STRATEGY = "email_chunk"
+
+
+# ---------------------------------------------------------------------------
+# Model names
+# ---------------------------------------------------------------------------
+
+DENSE_EMBEDDING_MODEL  = "BAAI/bge-small-en-v1.5"
+SPARSE_EMBEDDING_MODEL = "Qdrant/bm25"
+RERANKER_MODEL         = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+LLM_MODEL              = "qwen3.5:2b"
+LLM_BASE_URL           = "http://localhost:11434"
+
+
+# ---------------------------------------------------------------------------
+# Pipeline configs
+# ---------------------------------------------------------------------------
+
+MAX_RETRIES            = 3
+RETRY_DELAY_SECONDS    = 5
+EMBEDDING_BATCH_SIZE   = 64
+LLM_REQUEST_TIMEOUT_SECONDS = 120
+
+DEFAULT_TOP_K_RETRIEVE = 10
+DEFAULT_TOP_K_RERANK   = 5
+CONTEXT_MAX_TOKENS     = 5000
+
+
+# ---------------------------------------------------------------------------
+# General-purpose regex (multi-use only — single-use cleaning patterns stay
+# local to data_cleaning.py, not duplicated here)
+# ---------------------------------------------------------------------------
+
+EMAIL_REGEX = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
+URL_REGEX   = r"https?://\S+"
+
+
+# ---------------------------------------------------------------------------
+# System prompt (RAG-specific) — moved from prompting/builder.py for
+# centralized access; builder.py imports this rather than redefining it.
+# ---------------------------------------------------------------------------
+
+PROMPT_VERSION = "v1"
+
+SYSTEM_PROMPT_V1 = """You are an Email Intelligence Assistant for SMB Freight FZE aviation operations.
+
+RULES:
+1. Answer ONLY using the provided email context. Do not use outside knowledge.
+2. If the context does not contain enough information, say so explicitly.
+3. Cite the specific email(s) that support your answer using [Email N] format, where N matches the numbering in the context.
+4. For timeline/lifecycle questions, present information chronologically.
+5. Preserve exact operational details (flight numbers, times, conditions, NOTAM references, request IDs).
+6. Do not reveal personal contact information (phone numbers, personal emails) unless specifically asked.
+7. If multiple emails conflict (e.g. a later email revises an earlier decision), prefer the most recent one and note the change."""
