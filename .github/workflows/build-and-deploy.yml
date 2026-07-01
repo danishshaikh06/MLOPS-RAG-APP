@@ -10,8 +10,8 @@ on:
 
 env:
     DOCKER_IMAGE: dan06/my_rag_app # Replace with your DockerHub image
-    AZURE_WEBAPP_NAME: my-rag-app-app # Replace with your Azure Web App name
-    AZURE_WEBAPP_RG: my-rag-app-rg # Replace with your Azure Web App resource group
+   # AZURE_WEBAPP_NAME: my-rag-app-app # Replace with your Azure Web App name
+   # AZURE_WEBAPP_RG: my-rag-app-rg # Replace with your Azure Web App resource group
 
 jobs:
     build-push-docker-image:
